@@ -1,15 +1,17 @@
 """
-AI Execution Companion OS v2 — Telegram Bot
-=============================================
+AI Execution Companion OS v2 — Telegram Bot (Single File)
+==========================================================
 极简主流程：/today → 自动锁定A → 开始2分钟 → 完成/升级/卡住 → 证据
-管理入口：/manage → /goal /phases /tasks /settings
+管理入口：/manage → goal/phases/tasks
 """
 
 import os
+import re
 import json
+import sqlite3
 import logging
-import asyncio
 from datetime import datetime, date
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,1001 +19,1272 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters,
 )
 
-from db import database as db
-from core import engine
-from llm import openai_client as llm
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════
-# KEYBOARD HELPERS
-# ═══════════════════════════════════════════
 
-def kb(buttons):
+###############################################################################
+# ██████  DATABASE LAYER (SQLite)
+###############################################################################
+
+DB_PATH = os.environ.get("ECOS_DB_PATH", "ecos.db")
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        timezone TEXT DEFAULT 'Asia/Shanghai',
+        default_step_minutes INTEGER DEFAULT 8,
+        tone TEXT DEFAULT 'firm_kind',
+        low_energy_mode INTEGER DEFAULT 0,
+        weekly_summary_enabled INTEGER DEFAULT 0,
+        streak_days INTEGER DEFAULT 0,
+        last_progress_date TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS goals (
+        goal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        deadline_date TEXT,
+        track TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS phases (
+        phase_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        goal_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        is_active INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS task_items (
+        task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phase_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        type TEXT DEFAULT 'misc',
+        status TEXT DEFAULT 'not_started',
+        tags TEXT DEFAULT '[]',
+        difficulty_self_rating INTEGER,
+        source TEXT DEFAULT 'manual',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS mainlines (
+        mainline_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        goal_id INTEGER,
+        phase_id INTEGER,
+        date TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT DEFAULT 'manual',
+        locked INTEGER DEFAULT 1,
+        task_id_ref INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS steps (
+        step_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mainline_id INTEGER NOT NULL,
+        kind TEXT DEFAULT 'micro',
+        duration_min INTEGER DEFAULT 2,
+        instruction TEXT NOT NULL,
+        acceptance_criteria TEXT NOT NULL,
+        difficulty INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'ready',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS deferred_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        deferred_step_id INTEGER NOT NULL,
+        mainline_id INTEGER,
+        reason TEXT DEFAULT 'exit',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS stuck_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_id INTEGER NOT NULL,
+        stuck_type TEXT NOT NULL,
+        emotion_label TEXT,
+        user_note TEXT,
+        timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS evidence (
+        evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        counter_evidence TEXT NOT NULL,
+        tags TEXT DEFAULT '["small_win"]',
+        timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS if_then_plans (
+        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        if_trigger TEXT NOT NULL,
+        then_action TEXT NOT NULL,
+        reward TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS import_drafts (
+        import_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        phase_id INTEGER NOT NULL,
+        source TEXT DEFAULT 'paste',
+        raw_text TEXT,
+        parsed_items TEXT DEFAULT '[]',
+        state TEXT DEFAULT 'draft',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+
+# ── User CRUD ──
+
+def ensure_user(uid):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        conn.execute("INSERT INTO users (user_id) VALUES (?)", (uid,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_user(uid):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_user(uid, **kw):
+    conn = get_conn()
+    s = ", ".join(f"{k}=?" for k in kw)
+    conn.execute(f"UPDATE users SET {s} WHERE user_id=?", list(kw.values()) + [uid])
+    conn.commit()
+    conn.close()
+
+
+def update_streak(uid):
+    u = get_user(uid)
+    today = date.today().isoformat()
+    if u["last_progress_date"] != today:
+        n = u["streak_days"] + 1
+        update_user(uid, streak_days=n, last_progress_date=today)
+        return n
+    return u["streak_days"]
+
+
+# ── Goal ──
+
+def create_goal(uid, title, deadline=None, track=None):
+    conn = get_conn()
+    cur = conn.execute("INSERT INTO goals (user_id,title,deadline_date,track) VALUES (?,?,?,?)",
+                       (uid, title, deadline, track))
+    gid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return gid
+
+
+def get_active_goal(uid):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM goals WHERE user_id=? AND is_active=1 ORDER BY created_at DESC LIMIT 1",
+                       (uid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── Phase ──
+
+def create_phase(goal_id, title, is_active=1):
+    conn = get_conn()
+    if is_active:
+        conn.execute("UPDATE phases SET is_active=0 WHERE goal_id=?", (goal_id,))
+    cur = conn.execute("INSERT INTO phases (goal_id,title,is_active) VALUES (?,?,?)",
+                       (goal_id, title, is_active))
+    pid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return pid
+
+
+def list_phases(goal_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM phases WHERE goal_id=? ORDER BY created_at", (goal_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_active_phase(goal_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM phases WHERE goal_id=? AND is_active=1", (goal_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_active_phase(goal_id, phase_id):
+    conn = get_conn()
+    conn.execute("UPDATE phases SET is_active=0 WHERE goal_id=?", (goal_id,))
+    conn.execute("UPDATE phases SET is_active=1 WHERE phase_id=?", (phase_id,))
+    conn.commit()
+    conn.close()
+
+
+# ── TaskItem ──
+
+def create_task(phase_id, title, type_="misc", status="not_started", tags=None, difficulty=None, source="manual"):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO task_items (phase_id,title,type,status,tags,difficulty_self_rating,source) VALUES (?,?,?,?,?,?,?)",
+        (phase_id, title, type_, status, json.dumps(tags or []), difficulty, source))
+    tid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def list_tasks(phase_id, status_filter=None):
+    conn = get_conn()
+    q = "SELECT * FROM task_items WHERE phase_id=?"
+    p = [phase_id]
+    if status_filter:
+        q += " AND status=?"
+        p.append(status_filter)
+    q += " ORDER BY created_at"
+    rows = conn.execute(q, p).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_task(task_id, **kw):
+    kw["updated_at"] = datetime.now().isoformat()
+    conn = get_conn()
+    s = ", ".join(f"{k}=?" for k in kw)
+    conn.execute(f"UPDATE task_items SET {s} WHERE task_id=?", list(kw.values()) + [task_id])
+    conn.commit()
+    conn.close()
+
+
+def delete_task(task_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM task_items WHERE task_id=?", (task_id,))
+    conn.commit()
+    conn.close()
+
+
+# ── Mainline ──
+
+def create_mainline(uid, title, source="manual", goal_id=None, phase_id=None, task_id_ref=None):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO mainlines (user_id,goal_id,phase_id,date,title,source,task_id_ref) VALUES (?,?,?,?,?,?,?)",
+        (uid, goal_id, phase_id, date.today().isoformat(), title, source, task_id_ref))
+    mid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return mid
+
+
+def get_today_mainline(uid):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM mainlines WHERE user_id=? AND date=? ORDER BY created_at DESC LIMIT 1",
+        (uid, date.today().isoformat())).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── Step ──
+
+def create_step(mainline_id, kind, dur, instruction, criteria, difficulty=1):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO steps (mainline_id,kind,duration_min,instruction,acceptance_criteria,difficulty) VALUES (?,?,?,?,?,?)",
+        (mainline_id, kind, dur, instruction, criteria, difficulty))
+    sid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return sid
+
+
+def get_step(sid):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM steps WHERE step_id=?", (sid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_step(sid, **kw):
+    conn = get_conn()
+    s = ", ".join(f"{k}=?" for k in kw)
+    conn.execute(f"UPDATE steps SET {s} WHERE step_id=?", list(kw.values()) + [sid])
+    conn.commit()
+    conn.close()
+
+
+def get_active_step(mainline_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM steps WHERE mainline_id=? AND status IN ('ready','executing') ORDER BY created_at DESC LIMIT 1",
+        (mainline_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── Deferred ──
+
+def create_deferred(uid, step_id, mainline_id, reason="exit"):
+    conn = get_conn()
+    conn.execute("INSERT INTO deferred_links (user_id,deferred_step_id,mainline_id,reason) VALUES (?,?,?,?)",
+                 (uid, step_id, mainline_id, reason))
+    conn.commit()
+    conn.close()
+
+
+def get_deferred(uid):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT dl.*, s.instruction, s.acceptance_criteria, s.duration_min, s.mainline_id, m.title as mainline_title "
+        "FROM deferred_links dl "
+        "JOIN steps s ON dl.deferred_step_id=s.step_id "
+        "JOIN mainlines m ON dl.mainline_id=m.mainline_id "
+        "WHERE dl.user_id=? ORDER BY dl.created_at DESC LIMIT 1",
+        (uid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def clear_deferred(uid):
+    conn = get_conn()
+    conn.execute("DELETE FROM deferred_links WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+
+# ── StuckEvent ──
+
+def create_stuck_event(step_id, stuck_type, emotion_label=None):
+    conn = get_conn()
+    conn.execute("INSERT INTO stuck_events (step_id,stuck_type,emotion_label) VALUES (?,?,?)",
+                 (step_id, stuck_type, emotion_label))
+    conn.commit()
+    conn.close()
+
+
+# ── Evidence ──
+
+def create_evidence(uid, text, tags=None):
+    conn = get_conn()
+    cur = conn.execute("INSERT INTO evidence (user_id,counter_evidence,tags) VALUES (?,?,?)",
+                       (uid, text, json.dumps(tags or ["small_win"])))
+    eid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return eid
+
+
+def list_evidence(uid, limit=10):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM evidence WHERE user_id=? ORDER BY timestamp DESC LIMIT ?",
+                        (uid, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── IfThen ──
+
+def save_if_then(uid, if_trigger, then_action, reward=None):
+    conn = get_conn()
+    conn.execute("INSERT INTO if_then_plans (user_id,date,if_trigger,then_action,reward) VALUES (?,?,?,?,?)",
+                 (uid, date.today().isoformat(), if_trigger, then_action, reward))
+    conn.commit()
+    conn.close()
+
+
+# ── ImportDraft ──
+
+def create_import_draft(uid, phase_id, raw_text, parsed_items, source="paste"):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO import_drafts (user_id,phase_id,source,raw_text,parsed_items) VALUES (?,?,?,?,?)",
+        (uid, phase_id, source, raw_text, json.dumps(parsed_items, ensure_ascii=False)))
+    iid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return iid
+
+
+def get_import_draft(iid):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM import_drafts WHERE import_id=?", (iid,)).fetchone()
+    conn.close()
+    if row:
+        d = dict(row)
+        d["parsed_items"] = json.loads(d["parsed_items"])
+        return d
+    return None
+
+
+def confirm_import(iid):
+    draft = get_import_draft(iid)
+    if not draft:
+        return
+    for item in draft["parsed_items"]:
+        create_task(draft["phase_id"], item.get("title", ""), item.get("type", "misc"),
+                    item.get("status", "not_started"), item.get("tags", []),
+                    item.get("difficulty_self_rating"), draft["source"])
+    conn = get_conn()
+    conn.execute("UPDATE import_drafts SET state='confirmed' WHERE import_id=?", (iid,))
+    conn.commit()
+    conn.close()
+
+
+def discard_import(iid):
+    conn = get_conn()
+    conn.execute("UPDATE import_drafts SET state='discarded' WHERE import_id=?", (iid,))
+    conn.commit()
+    conn.close()
+
+
+###############################################################################
+# ██████  LLM LAYER (OpenAI)
+###############################################################################
+
+_openai_client = None
+
+
+def _get_openai():
+    global _openai_client
+    if _openai_client is None:
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not key:
+            return None
+        try:
+            from openai import OpenAI
+            _openai_client = OpenAI(api_key=key)
+        except ImportError:
+            logger.warning("openai package not installed")
+            return None
+    return _openai_client
+
+
+def _call_llm(system, user_msg, retries=1):
+    c = _get_openai()
+    if not c:
+        return None
+    for attempt in range(retries + 1):
+        try:
+            extra = "\n\n⚠️ 你必须只输出JSON，不要输出其他文字。" if attempt > 0 else ""
+            resp = c.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": system + extra},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.7, max_tokens=800,
+                response_format={"type": "json_object"})
+            return json.loads(resp.choices[0].message.content.strip())
+        except Exception as e:
+            logger.warning(f"LLM error (attempt {attempt+1}): {e}")
+    return None
+
+
+SYS_BASE = """你是"执行陪伴系统"的AI引擎。你只输出JSON。
+语气：坚定、温和、短句。不说教。用"我们现在只做…""下一步是…"。中文输出。"""
+
+
+def llm_micro_step(mainline_title, task_title=None):
+    system = SYS_BASE + '\n输出格式：{"type":"micro_step","micro_step":{"duration_min":2,"instruction":"...","acceptance_criteria":"..."}}\ninstruction必须2分钟内可完成的具体动作。'
+    user = f"今日主线：{mainline_title}"
+    if task_title:
+        user += f"\n任务：{task_title}"
+    user += "\n生成一个2分钟起步动作。"
+    r = _call_llm(system, user)
+    if r and "micro_step" in r:
+        return r
+    return {"type": "micro_step", "micro_step": {
+        "duration_min": 2,
+        "instruction": f"打开「{mainline_title[:20]}」相关材料，找到你要开始的位置。",
+        "acceptance_criteria": "材料已打开在屏幕上"}}
+
+
+def llm_upgrade_step(mainline_title, micro_instruction=None):
+    system = SYS_BASE + '\n输出格式：{"type":"next_step","step":{"duration_min":8,"instruction":"...","acceptance_criteria":"...","difficulty":1}}\n这是完成2分钟起步后的8分钟升级动作。'
+    user = f"今日主线：{mainline_title}"
+    if micro_instruction:
+        user += f"\n刚完成：{micro_instruction}"
+    user += "\n生成8分钟升级动作。"
+    r = _call_llm(system, user)
+    if r and "step" in r:
+        return r
+    return {"type": "next_step", "step": {
+        "duration_min": 8,
+        "instruction": f"继续推进「{mainline_title[:20]}」——完成下一个小节或练习。",
+        "acceptance_criteria": "能用1句话说出完成了什么", "difficulty": 1}}
+
+
+def llm_if_then(mainline_title):
+    system = SYS_BASE + '\n输出格式：{"type":"if_then_plan","plan":{"if_trigger":"如果…","then_action":"那么…","reward":"完成后…"}}'
+    r = _call_llm(system, f"今日主线：{mainline_title}\n生成if-then实施意图。")
+    if r and "plan" in r:
+        return r
+    return {"type": "if_then_plan", "plan": {
+        "if_trigger": "如果我开始犹豫或想刷手机",
+        "then_action": "我先做2分钟起步动作", "reward": "完成后休息3分钟"}}
+
+
+def llm_intervention(stuck_type, emotion=None, mainline=None, step_instr=None, evidence_list=None):
+    ev_section = ""
+    if stuck_type == "SELF_LIMITING" and evidence_list:
+        ev_section = f"\nSELF_LIMITING必须包含evidence_quotes数组：\n{json.dumps(evidence_list, ensure_ascii=False)}"
+    system = SYS_BASE + f"""
+输出格式：{{"type":"intervention","stuck_type":"{stuck_type}","emotion_label":"...","body_reset":"30秒身体动作","intervention_text":"30-90秒干预(<150字)","restart_step":{{"duration_min":2,"instruction":"...","acceptance_criteria":"..."}},"push_line":"一句话","evidence_quotes":null}}{ev_section}"""
+    user = f"卡点：{stuck_type}"
+    if emotion: user += f"\n情绪：{emotion}"
+    if mainline: user += f"\n主线：{mainline}"
+    r = _call_llm(system, user + "\n生成干预。")
+    if r and "intervention_text" in r:
+        if stuck_type == "SELF_LIMITING" and not r.get("evidence_quotes") and evidence_list:
+            r["evidence_quotes"] = evidence_list[:3]
+        return r
+    # Fallback
+    FB = {
+        "PERFECTIONISM": ("双手握拳3秒，松开。", "完美是陷阱。我们只做一个烂版本——比空白好一万倍。",
+            {"duration_min": 2, "instruction": "写下关于任务你知道的3个词。不准修改。", "acceptance_criteria": "3个词出现在屏幕上"}, "烂版本 > 空白 →"),
+        "GOAL_TOO_BIG": ("站起来伸展双臂5秒。", "你不需要看到终点，只看下一步。",
+            {"duration_min": 2, "instruction": "打开你需要的页面或文件。只是打开。", "acceptance_criteria": "页面已打开"}, "打开了就是开始 →"),
+        "OVERTHINKING": ("鼻子吸气→再吸→嘴巴长呼气，做两轮。", "大脑在转圈不是在前进。开始了才会想清楚。",
+            {"duration_min": 2, "instruction": "不做选择——直接做第一个动作。", "acceptance_criteria": "动手了"}, "动了就对了 →"),
+        "EMOTIONAL_FRICTION": ("双脚踩实地面，感受脚底压力10秒。", "给情绪取个名字。情绪不需要消失，带着它做2分钟。",
+            {"duration_min": 2, "instruction": "带着情绪，写下今天任务的标题。", "acceptance_criteria": "写下了标题"}, "我们已经在动了 →"),
+        "REWARD_MISMATCH": ("手机翻面朝下推远。", "先做2分钟再刷——带着完成感刷，完全不一样。",
+            {"duration_min": 2, "instruction": "手机远离，打开任务材料。", "acceptance_criteria": "手机远离+材料打开"}, "2分钟后你自由了 →"),
+        "SELF_LIMITING": ("双手按压桌面5秒，松开。", "「我不行」是想法不是事实。只需要试2分钟。",
+            {"duration_min": 2, "instruction": "写下：「我不确定我行，但我可以试2分钟。」", "acceptance_criteria": "写下了这句话"}, "试了就是证据 →"),
+    }
+    fb = FB.get(stuck_type, FB["OVERTHINKING"])
+    return {"type": "intervention", "stuck_type": stuck_type, "emotion_label": emotion or "",
+            "body_reset": fb[0], "intervention_text": fb[1], "restart_step": fb[2], "push_line": fb[3],
+            "evidence_quotes": evidence_list[:3] if stuck_type == "SELF_LIMITING" and evidence_list else None}
+
+
+###############################################################################
+# ██████  CORE ENGINE (Rules Layer)
+###############################################################################
+
+def choose_candidates(uid, phase_id=None, low_energy=False):
+    if not phase_id:
+        goal = get_active_goal(uid)
+        if goal:
+            phase = get_active_phase(goal["goal_id"])
+            if phase:
+                phase_id = phase["phase_id"]
+    if not phase_id:
+        return {
+            "A": {"title": "建立任务池 — 写出5个待办任务标题", "reason": "还没有任务", "task_id": None},
+            "B": {"title": "建立任务池 — 写出3个关键任务标题", "reason": "轻量版", "task_id": None}}
+
+    ip = list_tasks(phase_id, "in_progress")
+    ns = list_tasks(phase_id, "not_started")
+    all_t = ip + ns
+    if not all_t:
+        return {
+            "A": {"title": "建立任务池 — 写出5个待办任务标题", "reason": "任务池为空", "task_id": None},
+            "B": {"title": "建立任务池 — 写出3个关键任务标题", "reason": "轻量版", "task_id": None}}
+
+    primary = ip[0] if ip else ns[0]
+    secondary = next((t for t in all_t if t["task_id"] != primary["task_id"]), None)
+    a = {"title": f"推进「{primary['title']}」",
+         "reason": "继续进行中" if primary["status"] == "in_progress" else "优先启动",
+         "task_id": primary["task_id"]}
+    if secondary:
+        b = {"title": f"轻量推进「{secondary['title']}」", "reason": "低能量也能推进",
+             "task_id": secondary["task_id"]}
+    else:
+        b = {"title": f"「{primary['title']}」— 只做最小起步", "reason": "缩小版",
+             "task_id": primary["task_id"]}
+    return {"A": a, "B": b}
+
+
+BIG_GOAL_RE = [r"\d+天", r"\d+个月", r"学位", r"毕业", r"全部", r"所有", r"完成整个",
+               r"master", r"degree", r"finish all", r"月内", r"半年", r"一年"]
+
+def is_big_goal(text):
+    t = text.lower()
+    return any(re.search(p, t) for p in BIG_GOAL_RE)
+
+
+def parse_import_text(raw):
+    items = []
+    for line in raw.strip().split("\n"):
+        line = line.strip()
+        if not line: continue
+        parts = re.split(r"\s*[-—]\s*", line)
+        title = parts[0].strip()
+        if not title: continue
+        status, tags, type_ = "not_started", [], "misc"
+        for part in parts[1:]:
+            p = part.strip().lower()
+            if p in ("not_started", "in_progress", "completed", "dropped"):
+                status = p
+            elif p.startswith("tags:"):
+                tags = [t.strip() for t in p.replace("tags:", "").split(",") if t.strip()]
+            elif p.startswith("type:"):
+                type_ = p.replace("type:", "").strip()
+        items.append({"title": title, "type": type_, "status": status, "tags": tags, "difficulty_self_rating": None})
+    return items
+
+
+###############################################################################
+# ██████  TELEGRAM BOT HANDLERS
+###############################################################################
+
+def bkb(buttons):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
-        for row in buttons
-    ])
+        for row in buttons])
 
-# ═══════════════════════════════════════════
-# /start
-# ═══════════════════════════════════════════
+
+async def _send(msg, text, markup):
+    try:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except:
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ── /start ──
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.ensure_user(user_id)
+    ensure_user(update.effective_user.id)
     await update.message.reply_text(
-        "🎯 <b>Execution Companion</b>\n\n"
-        "今天只做一件事，一步一步走。\n\n"
-        "👉 /today — 开始今天的推进\n"
-        "⚙️ /manage — 管理目标/任务",
+        "🎯 <b>Execution Companion</b>\n\n今天只做一件事，一步一步走。",
         parse_mode="HTML",
-        reply_markup=kb([
-            [("▶️ 开始今天", "cmd_today")],
-            [("⚙️ 管理", "cmd_manage")],
-        ]),
-    )
+        reply_markup=bkb([[("▶️ 开始今天", "cmd_today")], [("⚙️ 管理", "cmd_manage")]]))
 
-# ═══════════════════════════════════════════
-# /today — 主流程核心
-# ═══════════════════════════════════════════
+
+# ── /today ──
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
-    user_id = update.effective_user.id
-    db.ensure_user(user_id)
-
+    uid = update.effective_user.id
+    ensure_user(uid)
     if update.callback_query:
         await update.callback_query.answer()
 
-    # ── 1. Check deferred step ──
-    deferred = db.get_deferred(user_id)
+    # 1. Check deferred
+    deferred = get_deferred(uid)
     if deferred:
-        ctx.user_data["current_step_id"] = deferred["deferred_step_id"]
-        ctx.user_data["current_mainline_id"] = deferred["mainline_id"]
-        db.update_step(deferred["deferred_step_id"], status="ready")
-        db.clear_deferred(user_id)
-
-        text = (
-            f"📌 <b>继续昨天的推进</b>\n\n"
-            f"🔹 {deferred['mainline_title']}\n\n"
-            f"{deferred['instruction']}\n\n"
-            f"✅ {deferred['acceptance_criteria']}"
-        )
-        await _send(msg, text, kb([
-            [("▶️ 开始 2 分钟", "timer_micro")],
-            [("🔄 换一个新任务", "today_fresh")],
-        ]))
+        ctx.user_data["step_id"] = deferred["deferred_step_id"]
+        ctx.user_data["ml_id"] = deferred["mainline_id"]
+        update_step(deferred["deferred_step_id"], status="ready")
+        clear_deferred(uid)
+        await _send(msg,
+            f"📌 <b>继续昨天的推进</b>\n\n🔹 {deferred['mainline_title']}\n\n{deferred['instruction']}\n\n✅ {deferred['acceptance_criteria']}",
+            bkb([[("▶️ 开始 2 分钟", "timer_micro")], [("🔄 换一个新任务", "today_fresh")]]))
         return
 
-    # ── 2. Check existing today mainline ──
-    existing = db.get_today_mainline(user_id)
+    # 2. Check existing mainline today
+    existing = get_today_mainline(uid)
     if existing:
-        step = db.get_active_step(existing["mainline_id"])
+        step = get_active_step(existing["mainline_id"])
         if step:
-            ctx.user_data["current_step_id"] = step["step_id"]
-            ctx.user_data["current_mainline_id"] = existing["mainline_id"]
-            await _show_step(msg, existing["title"], step)
+            ctx.user_data["step_id"] = step["step_id"]
+            ctx.user_data["ml_id"] = existing["mainline_id"]
+            await _send(msg,
+                f"📌 <b>{existing['title']}</b>\n\n{step['instruction']}\n\n✅ {step['acceptance_criteria']}",
+                bkb([[("▶️ 开始 {0} 分钟".format(step['duration_min']),
+                       "timer_micro" if step['kind'] == 'micro' else "timer_upgrade")]]))
             return
 
-    # ── 3. Generate candidates ──
-    await _generate_and_show_today(msg, ctx, user_id)
+    # 3. Generate new
+    await _gen_today(msg, ctx, uid)
 
 
-async def _generate_and_show_today(msg, ctx, user_id):
-    """Generate A/B candidates and auto-present A."""
-    goal = db.get_active_goal(user_id)
-    phase = None
+async def _gen_today(msg, ctx, uid):
+    goal = get_active_goal(uid)
     phase_id = None
-
+    goal_id = None
     if goal:
-        phase = db.get_active_phase(goal["goal_id"])
+        goal_id = goal["goal_id"]
+        phase = get_active_phase(goal_id)
         if phase:
             phase_id = phase["phase_id"]
 
-    user = db.get_user(user_id)
-    low_energy = bool(user.get("low_energy_mode", 0))
+    user = get_user(uid)
+    low = bool(user.get("low_energy_mode", 0))
+    cands = choose_candidates(uid, phase_id, low)
+    ctx.user_data["cands"] = cands
+    chosen = cands["B"] if low else cands["A"]
+    ctx.user_data["chosen"] = chosen
 
-    candidates = engine.choose_candidates(user_id, phase_id, low_energy)
-    ctx.user_data["candidates"] = candidates
-    ctx.user_data["phase_id"] = phase_id
-    ctx.user_data["goal_id"] = goal["goal_id"] if goal else None
+    ml_id = create_mainline(uid, chosen["title"], "auto_from_phase" if phase_id else "manual",
+                            goal_id, phase_id, chosen.get("task_id"))
+    ctx.user_data["ml_id"] = ml_id
 
-    chosen = candidates["B"] if low_energy else candidates["A"]
-    ctx.user_data["chosen_candidate"] = chosen
-
-    # Auto-lock A and generate micro step
-    mainline_id = db.create_mainline(
-        user_id=user_id,
-        title=chosen["title"],
-        source="auto_from_phase" if phase_id else "manual",
-        goal_id=goal["goal_id"] if goal else None,
-        phase_id=phase_id,
-        task_id_ref=chosen.get("task_id"),
-    )
-    ctx.user_data["current_mainline_id"] = mainline_id
-
-    # Mark task as in_progress
     if chosen.get("task_id"):
-        db.update_task(chosen["task_id"], status="in_progress")
+        update_task(chosen["task_id"], status="in_progress")
 
-    # Generate micro step via LLM
-    task_title = None
-    if chosen.get("task_id"):
-        # Get task title from candidates
-        pass
-    micro = llm.generate_micro_step(chosen["title"], task_title)
+    micro = llm_micro_step(chosen["title"])
     ms = micro["micro_step"]
+    sid = create_step(ml_id, "micro", ms["duration_min"], ms["instruction"], ms["acceptance_criteria"])
+    ctx.user_data["step_id"] = sid
 
-    step_id = db.create_step(
-        mainline_id=mainline_id,
-        kind="micro",
-        duration_min=ms["duration_min"],
-        instruction=ms["instruction"],
-        acceptance_criteria=ms["acceptance_criteria"],
-    )
-    ctx.user_data["current_step_id"] = step_id
+    # If-then (quiet save)
+    it = llm_if_then(chosen["title"])
+    if it and "plan" in it:
+        p = it["plan"]
+        save_if_then(uid, p.get("if_trigger", ""), p.get("then_action", ""), p.get("reward"))
 
-    # Generate if-then plan (async, save quietly)
-    if_then = llm.generate_if_then_plan(chosen["title"])
-    if if_then and "plan" in if_then:
-        plan = if_then["plan"]
-        db.save_if_then(user_id, plan.get("if_trigger", ""), plan.get("then_action", ""), plan.get("reward"))
+    btns = [[("▶️ 开始 2 分钟", "timer_micro")]]
+    if not low:
+        btns.append([("🔄 换一个", "switch_B")])
+    btns.append([("🔋 低能量模式", "low_energy")])
 
-    # Show to user
-    buttons = [[("▶️ 开始 2 分钟", "timer_micro")]]
-    if not low_energy:
-        buttons.append([("🔄 换一个", "switch_B")])
-    buttons.append([("🔋 低能量模式", "low_energy")])
-
-    text = (
-        f"📌 <b>今日主线</b>：{chosen['title']}\n\n"
-        f"🔹 <b>2 分钟起步</b>\n\n"
-        f"{ms['instruction']}\n\n"
-        f"✅ {ms['acceptance_criteria']}"
-    )
-    await _send(msg, text, kb(buttons))
+    await _send(msg,
+        f"📌 <b>今日主线</b>：{chosen['title']}\n\n🔹 <b>2 分钟起步</b>\n\n{ms['instruction']}\n\n✅ {ms['acceptance_criteria']}",
+        bkb(btns))
 
 
-async def _show_step(msg, mainline_title, step):
-    text = (
-        f"📌 <b>{mainline_title}</b>\n\n"
-        f"🔹 <b>{step['duration_min']} 分钟</b>\n\n"
-        f"{step['instruction']}\n\n"
-        f"✅ {step['acceptance_criteria']}"
-    )
-    await _send(msg, text, kb([
-        [("▶️ 开始 {0} 分钟".format(step['duration_min']), "timer_micro" if step['kind'] == 'micro' else "timer_upgrade")],
-    ]))
+# ── Callback Router ──
 
-
-# ═══════════════════════════════════════════
-# CALLBACK ROUTER
-# ═══════════════════════════════════════════
-
-async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
-    user_id = update.effective_user.id
-    db.ensure_user(user_id)
+    d = q.data
+    uid = update.effective_user.id
+    ensure_user(uid)
 
-    # ── Navigation ──
-    if data == "cmd_today":
-        return await cmd_today(update, ctx)
-    if data == "cmd_manage":
-        return await _show_manage(q.message, user_id)
+    if d == "cmd_today": return await cmd_today(update, ctx)
+    if d == "cmd_manage": return await _manage(q.message, uid)
 
-    # ── Today: switch to B ──
-    if data == "switch_B":
-        candidates = ctx.user_data.get("candidates", {})
-        b = candidates.get("B")
-        if not b:
-            await q.edit_message_text("没有备选方案，继续当前主线。")
-            return
+    if d == "today_fresh":
+        clear_deferred(uid)
+        return await _gen_today(q.message, ctx, uid)
 
-        # Re-lock with B
-        mainline_id = ctx.user_data.get("current_mainline_id")
-        if mainline_id:
-            # Update mainline title
-            conn = db.get_conn()
-            conn.execute("UPDATE mainlines SET title=? WHERE mainline_id=?", (b["title"], mainline_id))
+    # Switch to B
+    if d == "switch_B":
+        cands = ctx.user_data.get("cands", {})
+        b = cands.get("B")
+        if not b: return
+        ml_id = ctx.user_data.get("ml_id")
+        if ml_id:
+            conn = get_conn()
+            conn.execute("UPDATE mainlines SET title=? WHERE mainline_id=?", (b["title"], ml_id))
             conn.commit()
             conn.close()
-
-        micro = llm.generate_micro_step(b["title"])
+        micro = llm_micro_step(b["title"])
         ms = micro["micro_step"]
-        step_id = db.create_step(
-            mainline_id=mainline_id,
-            kind="micro",
-            duration_min=ms["duration_min"],
-            instruction=ms["instruction"],
-            acceptance_criteria=ms["acceptance_criteria"],
-        )
-        ctx.user_data["current_step_id"] = step_id
-        ctx.user_data["chosen_candidate"] = b
-
-        text = (
-            f"📌 <b>已切换</b>：{b['title']}\n\n"
-            f"🔹 <b>2 分钟起步</b>\n\n"
-            f"{ms['instruction']}\n\n"
-            f"✅ {ms['acceptance_criteria']}"
-        )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb([
-            [("▶️ 开始 2 分钟", "timer_micro")],
-        ]))
+        sid = create_step(ml_id, "micro", ms["duration_min"], ms["instruction"], ms["acceptance_criteria"])
+        ctx.user_data["step_id"] = sid
+        ctx.user_data["chosen"] = b
+        await q.edit_message_text(
+            f"📌 <b>已切换</b>：{b['title']}\n\n🔹 <b>2 分钟起步</b>\n\n{ms['instruction']}\n\n✅ {ms['acceptance_criteria']}",
+            parse_mode="HTML", reply_markup=bkb([[("▶️ 开始 2 分钟", "timer_micro")]]))
         return
 
-    # ── Low energy mode ──
-    if data == "low_energy":
-        db.update_user(user_id, low_energy_mode=1)
-        await q.edit_message_text("🔋 低能量模式已开启。重新生成…", parse_mode="HTML")
-        await _generate_and_show_today(q.message, ctx, user_id)
-        return
+    if d == "low_energy":
+        update_user(uid, low_energy_mode=1)
+        return await _gen_today(q.message, ctx, uid)
 
-    if data == "today_fresh":
-        db.clear_deferred(user_id)
-        await _generate_and_show_today(q.message, ctx, user_id)
-        return
-
-    # ── Timer start (micro: 2min) ──
-    if data == "timer_micro":
-        step_id = ctx.user_data.get("current_step_id")
-        if step_id:
-            db.update_step(step_id, status="executing")
+    # Timer micro
+    if d == "timer_micro":
+        sid = ctx.user_data.get("step_id")
+        if sid: update_step(sid, status="executing")
         await q.edit_message_text(
             "⏱ <b>2 分钟开始！</b>\n\n做完点「完成」，卡住点「卡住」。",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("✅ 完成了", "step_done_micro")],
-                [("🧱 卡住了", "step_stuck"), ("↩️ 缩小", "step_shrink")],
-                [("🚪 退出（明天继续）", "step_exit")],
-            ]),
-        )
+            parse_mode="HTML", reply_markup=bkb([
+                [("✅ 完成了", "done_micro")],
+                [("🧱 卡住了", "stuck"), ("↩️ 缩小", "shrink")],
+                [("🚪 退出（明天继续）", "exit")]]))
         return
 
-    # ── Timer start (upgrade: 8min) ──
-    if data == "timer_upgrade":
-        step_id = ctx.user_data.get("current_step_id")
-        if step_id:
-            db.update_step(step_id, status="executing")
+    # Timer upgrade
+    if d == "timer_upgrade":
+        sid = ctx.user_data.get("step_id")
+        if sid: update_step(sid, status="executing")
         await q.edit_message_text(
-            "⏱ <b>8 分钟继续！</b>\n\n你已经启动了，保持这个势头。",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("✅ 完成了", "step_done_upgrade")],
-                [("🧱 卡住了", "step_stuck"), ("↩️ 缩小", "step_shrink")],
-                [("🚪 退出（明天继续）", "step_exit")],
-            ]),
-        )
+            "⏱ <b>8 分钟继续！</b>\n\n保持这个势头。",
+            parse_mode="HTML", reply_markup=bkb([
+                [("✅ 完成了", "done_upgrade")],
+                [("🧱 卡住了", "stuck"), ("↩️ 缩小", "shrink")],
+                [("🚪 退出（明天继续）", "exit")]]))
         return
 
-    # ── Step done (micro) → offer upgrade ──
-    if data == "step_done_micro":
-        step_id = ctx.user_data.get("current_step_id")
-        if step_id:
-            db.update_step(step_id, status="done")
-
-        mainline_id = ctx.user_data.get("current_mainline_id")
-        mainline = None
-        if mainline_id:
-            conn = db.get_conn()
-            row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
-            conn.close()
-            mainline = dict(row) if row else None
-
-        # Generate upgrade step
-        title = mainline["title"] if mainline else "任务"
-        upgrade = llm.generate_upgrade_step(title)
+    # Done micro → offer upgrade
+    if d == "done_micro":
+        sid = ctx.user_data.get("step_id")
+        if sid: update_step(sid, status="done")
+        ml_id = ctx.user_data.get("ml_id")
+        conn = get_conn()
+        row = conn.execute("SELECT title FROM mainlines WHERE mainline_id=?", (ml_id,)).fetchone()
+        conn.close()
+        title = row["title"] if row else "任务"
+        step = get_step(sid) if sid else None
+        upgrade = llm_upgrade_step(title, step["instruction"] if step else None)
         us = upgrade["step"]
-
-        upgrade_step_id = db.create_step(
-            mainline_id=mainline_id,
-            kind="upgrade",
-            duration_min=us["duration_min"],
-            instruction=us["instruction"],
-            acceptance_criteria=us["acceptance_criteria"],
-            difficulty=us.get("difficulty", 1),
-        )
-        ctx.user_data["current_step_id"] = upgrade_step_id
-
+        new_sid = create_step(ml_id, "upgrade", us["duration_min"], us["instruction"], us["acceptance_criteria"], us.get("difficulty", 1))
+        ctx.user_data["step_id"] = new_sid
         await q.edit_message_text(
-            f"✅ <b>2 分钟完成！</b>\n\n"
-            f"🔥 继续 8 分钟吗？\n\n"
-            f"{us['instruction']}\n\n"
-            f"✅ {us['acceptance_criteria']}\n\n"
-            f"<i>结束也算赢，你已经推进了一步。</i>",
-            parse_mode="HTML",
-            reply_markup=kb([
+            f"✅ <b>2 分钟完成！</b>\n\n🔥 继续 8 分钟吗？\n\n{us['instruction']}\n\n✅ {us['acceptance_criteria']}\n\n<i>结束也算赢。</i>",
+            parse_mode="HTML", reply_markup=bkb([
                 [("🔥 继续 8 分钟", "timer_upgrade")],
-                [("🌙 结束（也算赢）", "review_start")],
-            ]),
-        )
+                [("🌙 结束（也算赢）", "review_start")]]))
         return
 
-    # ── Step done (upgrade) → review ──
-    if data == "step_done_upgrade":
-        step_id = ctx.user_data.get("current_step_id")
-        if step_id:
-            db.update_step(step_id, status="done")
-        await _start_review(q, ctx, user_id)
+    # Done upgrade
+    if d == "done_upgrade":
+        sid = ctx.user_data.get("step_id")
+        if sid: update_step(sid, status="done")
+        return await _review(q, ctx, uid)
+
+    if d == "review_start":
+        return await _review(q, ctx, uid)
+
+    # Stuck → emotion
+    if d == "stuck":
+        await q.edit_message_text("先给情绪取个名字：", reply_markup=bkb([
+            [("😤 烦躁", "emo_烦躁"), ("😰 焦虑", "emo_焦虑")],
+            [("😩 疲惫", "emo_疲惫"), ("😶 麻木", "emo_麻木")],
+            [("😔 沮丧", "emo_沮丧"), ("🤷 说不清", "emo_说不清")]]))
         return
 
-    # ── Review start ──
-    if data == "review_start":
-        await _start_review(q, ctx, user_id)
-        return
-
-    # ── Step stuck ──
-    if data == "step_stuck":
+    if d.startswith("emo_"):
+        ctx.user_data["emo"] = d[4:]
         await q.edit_message_text(
-            "先给情绪取个名字：",
-            reply_markup=kb([
-                [("😤 烦躁", "emo_烦躁"), ("😰 焦虑", "emo_焦虑")],
-                [("😩 疲惫", "emo_疲惫"), ("😶 麻木", "emo_麻木")],
-                [("😔 沮丧", "emo_沮丧"), ("🤷 不知道", "emo_不知道")],
-            ]),
-        )
+            f"情绪：<b>{d[4:]}</b>\n\n什么卡住了你？", parse_mode="HTML",
+            reply_markup=bkb([
+                [("✨ 完美主义", "st_PERFECTIONISM")],
+                [("🏔 目标太大", "st_GOAL_TOO_BIG")],
+                [("🌀 想太多", "st_OVERTHINKING")],
+                [("😶‍🌫️ 情绪内耗", "st_EMOTIONAL_FRICTION")],
+                [("📱 想刷手机", "st_REWARD_MISMATCH")],
+                [("🔒 觉得不行", "st_SELF_LIMITING")]]))
         return
 
-    # ── Emotion selected → stuck type ──
-    if data.startswith("emo_"):
-        emotion = data.replace("emo_", "")
-        ctx.user_data["emotion_label"] = emotion
-        await q.edit_message_text(
-            f"情绪：<b>{emotion}</b>\n\n什么卡住了你？",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("✨ 完美主义", "stuck_PERFECTIONISM")],
-                [("🏔 目标太大", "stuck_GOAL_TOO_BIG")],
-                [("🌀 想太多", "stuck_OVERTHINKING")],
-                [("😶‍🌫️ 情绪内耗", "stuck_EMOTIONAL_FRICTION")],
-                [("📱 想刷手机", "stuck_REWARD_MISMATCH")],
-                [("🔒 觉得不行", "stuck_SELF_LIMITING")],
-            ]),
-        )
-        return
+    if d.startswith("st_"):
+        st = d[3:]
+        emo = ctx.user_data.get("emo", "")
+        sid = ctx.user_data.get("step_id")
+        ml_id = ctx.user_data.get("ml_id")
+        step = get_step(sid) if sid else None
+        conn = get_conn()
+        row = conn.execute("SELECT title FROM mainlines WHERE mainline_id=?", (ml_id,)).fetchone() if ml_id else None
+        conn.close()
+        ml_title = row["title"] if row else None
 
-    # ── Stuck type selected → intervention ──
-    if data.startswith("stuck_"):
-        stuck_type = data.replace("stuck_", "")
-        emotion = ctx.user_data.get("emotion_label", "")
-        step_id = ctx.user_data.get("current_step_id")
-        step = db.get_step(step_id) if step_id else None
+        ev_list = None
+        if st == "SELF_LIMITING":
+            evs = list_evidence(uid, 5)
+            ev_list = [e["counter_evidence"] for e in evs] if evs else None
+        if sid:
+            create_stuck_event(sid, st, emo)
 
-        mainline_id = ctx.user_data.get("current_mainline_id")
-        mainline = None
-        if mainline_id:
-            conn = db.get_conn()
-            row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
-            conn.close()
-            mainline = dict(row) if row else None
-
-        # Get recent evidence for SELF_LIMITING
-        recent_evidence = None
-        if stuck_type == "SELF_LIMITING":
-            evs = db.list_evidence(user_id, limit=5)
-            recent_evidence = [e["counter_evidence"] for e in evs] if evs else None
-
-        # Record stuck event
-        if step_id:
-            db.create_stuck_event(step_id, stuck_type, emotion)
-
-        # Generate intervention
-        iv = llm.generate_intervention(
-            stuck_type=stuck_type,
-            emotion_label=emotion,
-            mainline_title=mainline["title"] if mainline else None,
-            step_instruction=step["instruction"] if step else None,
-            recent_evidence=recent_evidence,
-        )
-
-        # Build message
-        lines = [
-            f"💬 <b>{iv.get('intervention_text', '')}</b>\n",
-            f"🫁 <i>{iv.get('body_reset', '深呼吸3次。')}</i>\n",
-        ]
+        iv = llm_intervention(st, emo, ml_title, step["instruction"] if step else None, ev_list)
+        lines = [f"💬 <b>{iv.get('intervention_text', '')}</b>\n",
+                 f"🫁 <i>{iv.get('body_reset', '')}</i>\n"]
         if iv.get("evidence_quotes"):
             lines.append("📋 <b>你的证据：</b>")
             for eq in iv["evidence_quotes"]:
-                lines.append(f"  · {eq}")
+                lines.append(f"  · {eq[:60]}")
             lines.append("")
-
         rs = iv.get("restart_step", {})
-        lines.append(f"🔸 <b>起步动作</b>（{rs.get('duration_min', 2)} 分钟）\n")
-        lines.append(f"{rs.get('instruction', '')}\n")
-        lines.append(f"✅ {rs.get('acceptance_criteria', '')}\n")
-        lines.append(f"\n💬 <i>{iv.get('push_line', '回到计时器 →')}</i>")
+        lines += [f"🔸 <b>起步动作</b>（{rs.get('duration_min',2)} 分钟）\n",
+                  rs.get("instruction", ""), f"\n✅ {rs.get('acceptance_criteria', '')}",
+                  f"\n💬 <i>{iv.get('push_line', '→')}</i>"]
+        if ml_id:
+            new_sid = create_step(ml_id, "micro", rs.get("duration_min", 2),
+                                  rs.get("instruction", "做一个最小动作"), rs.get("acceptance_criteria", "动了就行"))
+            ctx.user_data["step_id"] = new_sid
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML",
+            reply_markup=bkb([[("▶️ 开始 2 分钟", "timer_micro")]]))
+        return
 
-        # Save restart step
-        if mainline_id:
-            restart_step_id = db.create_step(
-                mainline_id=mainline_id,
-                kind="micro",
-                duration_min=rs.get("duration_min", 2),
-                instruction=rs.get("instruction", "做一个最小动作"),
-                acceptance_criteria=rs.get("acceptance_criteria", "动了就行"),
-            )
-            ctx.user_data["current_step_id"] = restart_step_id
-
+    # Shrink
+    if d == "shrink":
+        sid = ctx.user_data.get("step_id")
+        ml_id = ctx.user_data.get("ml_id")
+        step = get_step(sid) if sid else None
+        instr = step["instruction"] if step else "做一个最小动作"
+        first = instr.split("，")[0] if "，" in instr else instr.split("。")[0]
+        if ml_id:
+            new_sid = create_step(ml_id, "micro", 2, f"只做一件事：{first}。做完就算赢。", "完成了这一个动作")
+            ctx.user_data["step_id"] = new_sid
         await q.edit_message_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("▶️ 开始 2 分钟", "timer_micro")],
-            ]),
-        )
+            f"↩️ <b>缩小到 2 分钟</b>\n\n只做：{first}\n\n✅ 做完就算赢",
+            parse_mode="HTML", reply_markup=bkb([[("▶️ 开始 2 分钟", "timer_micro")]]))
         return
 
-    # ── Shrink step ──
-    if data == "step_shrink":
-        step_id = ctx.user_data.get("current_step_id")
-        step = db.get_step(step_id) if step_id else None
-        mainline_id = ctx.user_data.get("current_mainline_id")
-
-        instruction = step["instruction"] if step else "做一个最小动作"
-        first_action = instruction.split("，")[0] if "，" in instruction else instruction.split("。")[0]
-
-        if mainline_id:
-            shrink_id = db.create_step(
-                mainline_id=mainline_id,
-                kind="micro",
-                duration_min=2,
-                instruction=f"只做一件事：{first_action}。做完就算赢。",
-                acceptance_criteria="完成了这一个动作",
-            )
-            ctx.user_data["current_step_id"] = shrink_id
-
+    # Exit (defer)
+    if d == "exit":
+        sid = ctx.user_data.get("step_id")
+        ml_id = ctx.user_data.get("ml_id")
+        if sid and ml_id:
+            update_step(sid, status="deferred")
+            create_deferred(uid, sid, ml_id, "exit")
         await q.edit_message_text(
-            f"↩️ <b>缩小到 2 分钟</b>\n\n"
-            f"只做一件事：{first_action}\n\n"
-            f"✅ 做完就算赢",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("▶️ 开始 2 分钟", "timer_micro")],
-            ]),
-        )
+            "🌙 <b>没关系，明天继续。</b>\n\n下次 /today 会自动接上。退出不是失败，是暂停。",
+            parse_mode="HTML", reply_markup=bkb([[("🎯 主菜单", "cmd_start_fresh")]]))
         return
 
-    # ── Exit (defer) ──
-    if data == "step_exit":
-        step_id = ctx.user_data.get("current_step_id")
-        mainline_id = ctx.user_data.get("current_mainline_id")
-        if step_id:
-            db.update_step(step_id, status="deferred")
-            db.create_deferred(user_id, step_id, mainline_id, reason="exit")
-
-        await q.edit_message_text(
-            "🌙 <b>没关系，明天继续。</b>\n\n"
-            "下次 /today 会自动帮你接上今天的位置。\n"
-            "退出不是失败，是暂停。",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("🎯 回到主菜单", "cmd_start_fresh")],
-            ]),
-        )
+    if d == "cmd_start_fresh":
+        await q.edit_message_text("🎯 随时发 /today 继续。", parse_mode="HTML")
         return
 
-    if data == "cmd_start_fresh":
-        await q.edit_message_text(
-            "🎯 随时发 /today 继续推进。",
-            parse_mode="HTML",
-        )
+    # Session end
+    if d == "session_end":
+        u = get_user(uid)
+        evs = list_evidence(uid, 5)
+        lines = ["🌙 <b>今天的推进完成了</b>\n", f"🔥 连续推进 <b>{u['streak_days']}</b> 天"]
+        if evs:
+            lines += ["\n📋 <b>证据库</b>"]
+            for e in evs:
+                lines.append(f"  · {e['counter_evidence'][:50]}")
+        lines.append("\n每一步都是证据。明天见。")
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML",
+            reply_markup=bkb([[("🎯 新 Session", "cmd_today")]]))
         return
 
-    # ── Review: stuck tag (optional) ──
-    if data.startswith("review_tag_"):
-        tag = data.replace("review_tag_", "")
-        ctx.user_data["review_stuck_tag"] = tag
-        await _finish_review(q, ctx, user_id)
-        return
-
-    if data == "review_skip_tag":
-        await _finish_review(q, ctx, user_id)
-        return
+    # Review tags
+    if d.startswith("rtag_"):
+        ctx.user_data["rtag"] = d[5:]
+        return await _finish_review(q, ctx, uid)
+    if d == "rtag_skip":
+        return await _finish_review(q, ctx, uid)
 
     # ── Manage callbacks ──
-    if data == "manage_goal":
-        return await _show_goal_menu(q.message, user_id, edit=True)
-    if data == "manage_phases":
-        return await _show_phases_menu(q.message, user_id)
-    if data == "manage_tasks":
-        return await _show_tasks_menu(q, ctx, user_id)
+    if d == "m_goal": return await _goal_menu(q, uid)
+    if d == "m_phases": return await _phases_menu(q, uid)
+    if d == "m_tasks": return await _tasks_menu(q, ctx, uid)
 
-    # ── Goal creation flow ──
-    if data == "goal_create":
+    if d == "goal_create":
         ctx.user_data["awaiting"] = "goal_title"
-        await q.edit_message_text("📝 发送你的目标（一句话）：\n\n例如：<i>180天拿到WGU CS学位</i>", parse_mode="HTML")
+        await q.edit_message_text("📝 发送你的目标：\n<i>例如：180天拿到CS学位</i>", parse_mode="HTML")
         return
 
-    # ── Phase creation ──
-    if data == "phase_create":
+    if d == "phase_create":
         ctx.user_data["awaiting"] = "phase_title"
-        goal = db.get_active_goal(user_id)
-        ctx.user_data["target_goal_id"] = goal["goal_id"] if goal else None
-        await q.edit_message_text("📝 发送阶段名称：\n\n例如：<i>Sophia先修阶段</i>", parse_mode="HTML")
+        await q.edit_message_text("📝 发送阶段名称：\n<i>例如：Sophia先修阶段</i>", parse_mode="HTML")
         return
 
-    if data.startswith("phase_activate_"):
-        phase_id = int(data.replace("phase_activate_", ""))
-        goal = db.get_active_goal(user_id)
-        if goal:
-            db.set_active_phase(goal["goal_id"], phase_id)
-        await q.edit_message_text("✅ 阶段已激活。", parse_mode="HTML")
+    if d.startswith("pa_"):
+        pid = int(d[3:])
+        goal = get_active_goal(uid)
+        if goal: set_active_phase(goal["goal_id"], pid)
+        await q.edit_message_text("✅ 阶段已激活。", parse_mode="HTML",
+            reply_markup=bkb([[("← 返回", "cmd_manage")]]))
         return
 
-    # ── Task management ──
-    if data == "tasks_add":
+    if d == "t_add":
         ctx.user_data["awaiting"] = "task_title"
         await q.edit_message_text("📝 发送任务标题：", parse_mode="HTML")
         return
 
-    if data == "tasks_import":
+    if d == "t_import":
         ctx.user_data["awaiting"] = "import_paste"
         await q.edit_message_text(
-            "📋 <b>粘贴任务清单</b>（一行一个）\n\n"
-            "格式：<code>任务名 - 状态 - tags:标签1,标签2</code>\n\n"
-            "例如：\n"
-            "<code>C960 Discrete Math - in_progress - tags:wgu,math\n"
-            "C867 Scripting - not_started - tags:wgu</code>\n\n"
-            "状态和标签可选，默认 not_started。",
-            parse_mode="HTML",
-        )
+            "📋 <b>粘贴任务清单</b>（一行一个）\n\n格式：<code>任务名 - 状态 - tags:标签</code>\n\n状态和标签可选。",
+            parse_mode="HTML")
         return
 
-    if data.startswith("import_confirm_"):
-        import_id = int(data.replace("import_confirm_", ""))
-        db.confirm_import(import_id)
-        draft = db.get_import_draft(import_id)
-        count = len(draft["parsed_items"]) if draft else 0
-        await q.edit_message_text(f"✅ 已导入 {count} 个任务！\n\n发 /today 开始推进。", parse_mode="HTML")
+    if d.startswith("ic_"):
+        iid = int(d[3:])
+        confirm_import(iid)
+        dr = get_import_draft(iid)
+        n = len(dr["parsed_items"]) if dr else 0
+        await q.edit_message_text(f"✅ 已导入 {n} 个任务！\n\n发 /today 开始推进。", parse_mode="HTML")
         return
 
-    if data.startswith("import_discard_"):
-        import_id = int(data.replace("import_discard_", ""))
-        db.discard_import(import_id)
-        await q.edit_message_text("🗑 已丢弃导入。", parse_mode="HTML")
+    if d.startswith("id_"):
+        discard_import(int(d[3:]))
+        await q.edit_message_text("🗑 已丢弃。", parse_mode="HTML")
         return
 
-    if data.startswith("task_toggle_"):
-        task_id = int(data.replace("task_toggle_", ""))
-        conn = db.get_conn()
-        row = conn.execute("SELECT status FROM task_items WHERE task_id=?", (task_id,)).fetchone()
+    if d.startswith("tt_"):
+        tid = int(d[3:])
+        conn = get_conn()
+        row = conn.execute("SELECT status FROM task_items WHERE task_id=?", (tid,)).fetchone()
         conn.close()
         if row:
             cycle = {"not_started": "in_progress", "in_progress": "completed", "completed": "not_started", "dropped": "not_started"}
-            new_status = cycle.get(row["status"], "not_started")
-            db.update_task(task_id, status=new_status)
-        return await _show_tasks_menu(q, ctx, user_id)
+            update_task(tid, status=cycle.get(row["status"], "not_started"))
+        return await _tasks_menu(q, ctx, uid)
 
-    if data.startswith("task_delete_"):
-        task_id = int(data.replace("task_delete_", ""))
-        db.delete_task(task_id)
-        return await _show_tasks_menu(q, ctx, user_id)
+    if d.startswith("td_"):
+        delete_task(int(d[3:]))
+        return await _tasks_menu(q, ctx, uid)
 
-    if data == "tasks_back":
-        return await _show_manage(q.message, user_id, edit=True)
+    if d == "t_back": return await _manage(q.message, uid, edit=True)
 
 
-# ═══════════════════════════════════════════
-# REVIEW FLOW
-# ═══════════════════════════════════════════
+# ── Review ──
 
-async def _start_review(q, ctx, user_id):
+async def _review(q, ctx, uid):
     await q.edit_message_text(
-        "✅ <b>推进了一步！</b>\n\n"
-        "今天卡在哪了？（可选）",
-        parse_mode="HTML",
-        reply_markup=kb([
-            [("✨ 完美主义", "review_tag_PERFECTIONISM"), ("🌀 想太多", "review_tag_OVERTHINKING")],
-            [("📱 想刷手机", "review_tag_REWARD_MISMATCH"), ("🔒 觉得不行", "review_tag_SELF_LIMITING")],
-            [("跳过", "review_skip_tag")],
-        ]),
-    )
+        "✅ <b>推进了一步！</b>\n\n今天卡在哪了？（可选）", parse_mode="HTML",
+        reply_markup=bkb([
+            [("✨ 完美主义", "rtag_PERFECTIONISM"), ("🌀 想太多", "rtag_OVERTHINKING")],
+            [("📱 想刷手机", "rtag_REWARD_MISMATCH"), ("🔒 觉得不行", "rtag_SELF_LIMITING")],
+            [("跳过", "rtag_skip")]]))
 
 
-async def _finish_review(q, ctx, user_id):
-    mainline_id = ctx.user_data.get("current_mainline_id")
-    mainline = None
-    if mainline_id:
-        conn = db.get_conn()
-        row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
-        conn.close()
-        mainline = dict(row) if row else None
-
-    step_id = ctx.user_data.get("current_step_id")
-    step = db.get_step(step_id) if step_id else None
-
-    # Build evidence
-    evidence_text = f"完成了：{mainline['title'] if mainline else '任务'}"
-    if step:
-        evidence_text += f" → {step['instruction'][:40]}…"
-
+async def _finish_review(q, ctx, uid):
+    ml_id = ctx.user_data.get("ml_id")
+    conn = get_conn()
+    row = conn.execute("SELECT title FROM mainlines WHERE mainline_id=?", (ml_id,)).fetchone() if ml_id else None
+    conn.close()
+    title = row["title"] if row else "任务"
+    sid = ctx.user_data.get("step_id")
+    step = get_step(sid) if sid else None
+    ev_text = f"完成了：{title}"
+    if step: ev_text += f" → {step['instruction'][:40]}…"
     tags = ["small_win"]
-    stuck_tag = ctx.user_data.get("review_stuck_tag")
-    if stuck_tag:
-        tags.append(stuck_tag)
-
-    db.create_evidence(user_id, evidence_text, tags)
-    streak = db.update_streak(user_id)
-
-    # Count total evidence
-    all_evidence = db.list_evidence(user_id, limit=100)
-
+    tag = ctx.user_data.get("rtag")
+    if tag: tags.append(tag)
+    create_evidence(uid, ev_text, tags)
+    streak = update_streak(uid)
+    all_ev = list_evidence(uid, 100)
     await q.edit_message_text(
-        f"📋 <b>证据已记录</b>\n\n"
-        f"「{evidence_text}」\n\n"
-        f"🔥 连续推进 <b>{streak}</b> 天\n"
-        f"📋 证据库共 <b>{len(all_evidence)}</b> 条\n\n"
-        f"每一步都是证据。",
-        parse_mode="HTML",
-        reply_markup=kb([
+        f"📋 <b>证据已记录</b>\n\n「{ev_text}」\n\n🔥 连续推进 <b>{streak}</b> 天\n📋 证据库共 <b>{len(all_ev)}</b> 条\n\n每一步都是证据。",
+        parse_mode="HTML", reply_markup=bkb([
             [("🎯 继续下一步", "cmd_today")],
-            [("🌙 今天结束", "session_end")],
-        ]),
-    )
-    return
+            [("🌙 今天结束", "session_end")]]))
 
 
-# ═══════════════════════════════════════════
-# /manage — 管理入口
-# ═══════════════════════════════════════════
+# ── Manage ──
 
 async def cmd_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.ensure_user(user_id)
+    uid = update.effective_user.id
+    ensure_user(uid)
     msg = update.message or update.callback_query.message
-    if update.callback_query:
-        await update.callback_query.answer()
-    await _show_manage(msg, user_id)
+    if update.callback_query: await update.callback_query.answer()
+    await _manage(msg, uid)
 
 
-async def _show_manage(msg, user_id, edit=False):
-    goal = db.get_active_goal(user_id)
-    phase = None
-    task_count = 0
-
-    status_lines = ["⚙️ <b>管理中心</b>\n"]
+async def _manage(msg, uid, edit=False):
+    goal = get_active_goal(uid)
+    lines = ["⚙️ <b>管理中心</b>\n"]
     if goal:
-        status_lines.append(f"🧭 目标：{goal['title']}")
-        phase = db.get_active_phase(goal["goal_id"])
+        lines.append(f"🧭 目标：{goal['title']}")
+        phase = get_active_phase(goal["goal_id"])
         if phase:
-            status_lines.append(f"📂 当前阶段：{phase['title']}")
-            tasks = db.list_tasks(phase["phase_id"])
-            task_count = len(tasks)
-            completed = sum(1 for t in tasks if t["status"] == "completed")
-            status_lines.append(f"📋 任务：{completed}/{task_count} 完成")
+            lines.append(f"📂 阶段：{phase['title']}")
+            tasks = list_tasks(phase["phase_id"])
+            c = sum(1 for t in tasks if t["status"] == "completed")
+            lines.append(f"📋 任务：{c}/{len(tasks)}")
     else:
-        status_lines.append("还没有设置目标。")
-
-    user = db.get_user(user_id)
-    status_lines.append(f"\n🔥 连续推进：{user['streak_days']} 天")
-
-    text = "\n".join(status_lines)
-    markup = kb([
-        [("🧭 目标", "manage_goal"), ("📂 阶段", "manage_phases")],
-        [("📋 任务", "manage_tasks")],
-        [("▶️ 回到 /today", "cmd_today")],
-    ])
-
+        lines.append("还没有目标。")
+    u = get_user(uid)
+    lines.append(f"\n🔥 连续：{u['streak_days']} 天")
+    mk = bkb([[("🧭 目标", "m_goal"), ("📂 阶段", "m_phases")],
+              [("📋 任务", "m_tasks")],
+              [("▶️ /today", "cmd_today")]])
+    text = "\n".join(lines)
     if edit:
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=mk)
     else:
-        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=mk)
 
 
-# ── Goal menu ──
-
-async def _show_goal_menu(msg, user_id, edit=False):
-    goal = db.get_active_goal(user_id)
+async def _goal_menu(q, uid):
+    goal = get_active_goal(uid)
     if goal:
         text = f"🧭 <b>当前目标</b>：{goal['title']}"
-        if goal.get("deadline_date"):
-            text += f"\n📅 截止：{goal['deadline_date']}"
-        markup = kb([
-            [("✏️ 创建新目标", "goal_create")],
-            [("← 返回", "cmd_manage")],
-        ])
     else:
-        text = "🧭 还没有目标。\n\n设一个长线目标（可选），系统会帮你拆解每天的推进点。"
-        markup = kb([
-            [("➕ 创建目标", "goal_create")],
-            [("← 返回", "cmd_manage")],
-        ])
-
-    if edit:
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    else:
-        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        text = "🧭 还没有目标。"
+    await q.edit_message_text(text, parse_mode="HTML",
+        reply_markup=bkb([[("➕ 创建目标", "goal_create")], [("← 返回", "cmd_manage")]]))
 
 
-# ── Phases menu ──
-
-async def _show_phases_menu(msg, user_id):
-    goal = db.get_active_goal(user_id)
+async def _phases_menu(q, uid):
+    goal = get_active_goal(uid)
     if not goal:
-        await msg.edit_text("先创建一个目标。", reply_markup=kb([[("🧭 创建目标", "goal_create")]]))
+        await q.edit_message_text("先创建目标。", reply_markup=bkb([[("🧭 创建", "goal_create")]]))
         return
-
-    phases = db.list_phases(goal["goal_id"])
+    phases = list_phases(goal["goal_id"])
     if not phases:
-        await msg.edit_text(
-            "📂 还没有阶段。\n\n阶段用来分段推进目标（例如：先修阶段 → 核心课程 → 冲刺）",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("➕ 创建阶段", "phase_create")],
-                [("← 返回", "cmd_manage")],
-            ]),
-        )
+        await q.edit_message_text("📂 还没有阶段。", parse_mode="HTML",
+            reply_markup=bkb([[("➕ 创建阶段", "phase_create")], [("← 返回", "cmd_manage")]]))
         return
-
-    lines = ["📂 <b>阶段列表</b>\n"]
-    buttons = []
+    lines = ["📂 <b>阶段</b>\n"]
+    btns = []
     for p in phases:
         icon = "🟢" if p["is_active"] else "⚪"
         lines.append(f"{icon} {p['title']}")
         if not p["is_active"]:
-            buttons.append([(f"激活「{p['title'][:15]}」", f"phase_activate_{p['phase_id']}")])
-
-    buttons.append([("➕ 新阶段", "phase_create")])
-    buttons.append([("← 返回", "cmd_manage")])
-
-    await msg.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
+            btns.append([(f"激活「{p['title'][:12]}」", f"pa_{p['phase_id']}")])
+    btns += [[("➕ 新阶段", "phase_create")], [("← 返回", "cmd_manage")]]
+    await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=bkb(btns))
 
 
-# ── Tasks menu ──
-
-async def _show_tasks_menu(q_or_msg, ctx, user_id):
-    goal = db.get_active_goal(user_id)
-    phase = None
-    if goal:
-        phase = db.get_active_phase(goal["goal_id"])
-
+async def _tasks_menu(q, ctx, uid):
+    goal = get_active_goal(uid)
+    phase = get_active_phase(goal["goal_id"]) if goal else None
+    msg = q.message if hasattr(q, 'message') else q
     if not phase:
-        msg = q_or_msg.message if hasattr(q_or_msg, 'message') else q_or_msg
-        text = "📋 先创建目标和阶段才能管理任务。"
-        try:
-            await msg.edit_text(text, reply_markup=kb([[("🧭 创建目标", "goal_create"), ("← 返回", "cmd_manage")]]))
-        except:
-            await msg.reply_text(text, reply_markup=kb([[("🧭 创建目标", "goal_create"), ("← 返回", "cmd_manage")]]))
+        try: await msg.edit_text("先创建目标和阶段。", reply_markup=bkb([[("🧭 创建", "goal_create")]]))
+        except: await msg.reply_text("先创建目标和阶段。", reply_markup=bkb([[("🧭 创建", "goal_create")]]))
         return
-
-    tasks = db.list_tasks(phase["phase_id"])
-    status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅", "dropped": "🗑"}
-
-    lines = [f"📋 <b>任务列表</b>（{phase['title']}）\n"]
-    lines.append("点击切换状态：⬜→🟡→✅\n")
-
-    buttons = []
+    tasks = list_tasks(phase["phase_id"])
+    icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅", "dropped": "🗑"}
+    lines = [f"📋 <b>任务</b>（{phase['title']}）\n", "点击切换状态\n"]
+    btns = []
     for t in tasks[:20]:
-        icon = status_icons.get(t["status"], "⬜")
-        buttons.append([(f"{icon} {t['title'][:30]}", f"task_toggle_{t['task_id']}")])
-
-    buttons.append([("➕ 添加任务", "tasks_add"), ("📋 批量导入", "tasks_import")])
-    buttons.append([("← 返回", "tasks_back")])
-
-    if not tasks:
-        lines.append("还没有任务。添加任务或批量导入。")
-
-    msg = q_or_msg.message if hasattr(q_or_msg, 'message') else q_or_msg
-    try:
-        await msg.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
-    except:
-        await msg.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
+        btns.append([(f"{icons.get(t['status'],'⬜')} {t['title'][:28]}", f"tt_{t['task_id']}")])
+    btns += [[("➕ 添加", "t_add"), ("📋 批量导入", "t_import")], [("← 返回", "t_back")]]
+    if not tasks: lines.append("还没有任务。")
+    try: await msg.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=bkb(btns))
+    except: await msg.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=bkb(btns))
 
 
-# ═══════════════════════════════════════════
-# TEXT MESSAGE HANDLER
-# ═══════════════════════════════════════════
+# ── Text handler ──
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     text = update.message.text.strip()
-    awaiting = ctx.user_data.get("awaiting")
-    db.ensure_user(user_id)
+    aw = ctx.user_data.get("awaiting")
+    ensure_user(uid)
 
-    # ── Goal creation ──
-    if awaiting == "goal_title":
+    if aw == "goal_title":
         ctx.user_data["awaiting"] = None
-        goal_id = db.create_goal(user_id, text)
-        # Auto-create default phase
-        phase_id = db.create_phase(goal_id, "默认阶段", is_active=1)
-        ctx.user_data["target_phase_id"] = phase_id
-
+        gid = create_goal(uid, text)
+        pid = create_phase(gid, "默认阶段", 1)
         await update.message.reply_text(
-            f"✅ 目标已创建：<b>{text}</b>\n\n"
-            f"已自动创建「默认阶段」。\n"
-            f"现在可以添加任务，或发 /today 开始推进。",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("📋 添加任务", "manage_tasks")],
-                [("▶️ 直接开始 /today", "cmd_today")],
-            ]),
-        )
+            f"✅ 目标：<b>{text}</b>\n已创建「默认阶段」。",
+            parse_mode="HTML", reply_markup=bkb([
+                [("📋 添加任务", "m_tasks")], [("▶️ /today", "cmd_today")]]))
         return
 
-    # ── Phase creation ──
-    if awaiting == "phase_title":
+    if aw == "phase_title":
         ctx.user_data["awaiting"] = None
-        goal_id = ctx.user_data.get("target_goal_id")
-        if not goal_id:
-            goal = db.get_active_goal(user_id)
-            goal_id = goal["goal_id"] if goal else None
-        if goal_id:
-            db.create_phase(goal_id, text, is_active=1)
-            await update.message.reply_text(f"✅ 阶段「{text}」已创建并激活。", parse_mode="HTML",
-                reply_markup=kb([[("📋 管理任务", "manage_tasks"), ("← 返回", "cmd_manage")]]))
+        goal = get_active_goal(uid)
+        if goal:
+            create_phase(goal["goal_id"], text, 1)
+            await update.message.reply_text(f"✅ 阶段「{text}」已激活。", parse_mode="HTML",
+                reply_markup=bkb([[("📋 任务", "m_tasks"), ("← 返回", "cmd_manage")]]))
         return
 
-    # ── Task creation ──
-    if awaiting == "task_title":
+    if aw == "task_title":
         ctx.user_data["awaiting"] = None
-        goal = db.get_active_goal(user_id)
-        phase = db.get_active_phase(goal["goal_id"]) if goal else None
+        goal = get_active_goal(uid)
+        phase = get_active_phase(goal["goal_id"]) if goal else None
         if phase:
-            db.create_task(phase["phase_id"], text)
-            await update.message.reply_text(f"✅ 任务已添加：{text}", parse_mode="HTML",
-                reply_markup=kb([[("➕ 继续添加", "tasks_add"), ("📋 查看任务", "manage_tasks")]]))
-        else:
-            await update.message.reply_text("先创建目标和阶段。", reply_markup=kb([[("🧭 创建目标", "goal_create")]]))
+            create_task(phase["phase_id"], text)
+            await update.message.reply_text(f"✅ 已添加：{text}", parse_mode="HTML",
+                reply_markup=bkb([[("➕ 继续添加", "t_add"), ("📋 查看", "m_tasks")]]))
         return
 
-    # ── Import paste ──
-    if awaiting == "import_paste":
+    if aw == "import_paste":
         ctx.user_data["awaiting"] = None
-        goal = db.get_active_goal(user_id)
-        phase = db.get_active_phase(goal["goal_id"]) if goal else None
+        goal = get_active_goal(uid)
+        phase = get_active_phase(goal["goal_id"]) if goal else None
         if not phase:
             await update.message.reply_text("先创建目标和阶段。")
             return
-
-        parsed = engine.parse_import_text(text)
+        parsed = parse_import_text(text)
         if not parsed:
-            await update.message.reply_text("没有解析到任务。请检查格式后重试。")
+            await update.message.reply_text("没有解析到任务，请检查格式。")
             return
-
-        import_id = db.create_import_draft(user_id, phase["phase_id"], text, parsed, "paste")
-
-        # Show preview
-        status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅"}
-        lines = [f"📋 <b>导入预览</b>（{len(parsed)} 个任务）\n"]
-        for i, item in enumerate(parsed[:20]):
-            icon = status_icons.get(item.get("status", "not_started"), "⬜")
-            tags = ", ".join(item.get("tags", []))
-            tag_str = f" [{tags}]" if tags else ""
-            lines.append(f"{i+1}. {icon} {item['title']}{tag_str}")
-
-        lines.append("\n确认导入？")
-
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("✅ 确认导入", f"import_confirm_{import_id}")],
-                [("🗑 丢弃", f"import_discard_{import_id}")],
-            ]),
-        )
+        iid = create_import_draft(uid, phase["phase_id"], text, parsed)
+        icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅"}
+        lines = [f"📋 <b>导入预览</b>（{len(parsed)} 个）\n"]
+        for i, it in enumerate(parsed[:20]):
+            tags = ", ".join(it.get("tags", []))
+            ts = f" [{tags}]" if tags else ""
+            lines.append(f"{i+1}. {icons.get(it['status'],'⬜')} {it['title']}{ts}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+            reply_markup=bkb([[("✅ 确认导入", f"ic_{iid}")], [("🗑 丢弃", f"id_{iid}")]]))
         return
 
-    # ── Default: treat as manual mainline (no goal/phase scenario) ──
-    if engine.is_big_goal(text):
+    # Default: quick manual mainline
+    if is_big_goal(text):
         await update.message.reply_text(
-            f"⚡ 「{text[:20]}…」太大了。\n\n"
-            "建议先用 /manage → 创建目标 → 添加任务，\n"
-            "然后 /today 会自动帮你拆成每天的小步。",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [("⚙️ 去管理", "cmd_manage")],
-                [("▶️ 直接开始", "cmd_today")],
-            ]),
-        )
+            f"⚡ 「{text[:20]}…」太大了。\n建议 /manage 创建目标+任务，然后 /today 自动拆步。",
+            parse_mode="HTML", reply_markup=bkb([[("⚙️ 管理", "cmd_manage")], [("▶️ 直接开始", "cmd_today")]]))
         return
 
-    # Quick manual mainline
-    mainline_id = db.create_mainline(user_id, text)
-    micro = llm.generate_micro_step(text)
+    ml_id = create_mainline(uid, text)
+    micro = llm_micro_step(text)
     ms = micro["micro_step"]
-    step_id = db.create_step(mainline_id, "micro", ms["duration_min"], ms["instruction"], ms["acceptance_criteria"])
-    ctx.user_data["current_mainline_id"] = mainline_id
-    ctx.user_data["current_step_id"] = step_id
-
+    sid = create_step(ml_id, "micro", ms["duration_min"], ms["instruction"], ms["acceptance_criteria"])
+    ctx.user_data["ml_id"] = ml_id
+    ctx.user_data["step_id"] = sid
     await update.message.reply_text(
-        f"🔒 <b>已锁定</b>：{text}\n\n"
-        f"🔹 <b>2 分钟起步</b>\n\n"
-        f"{ms['instruction']}\n\n"
-        f"✅ {ms['acceptance_criteria']}",
-        parse_mode="HTML",
-        reply_markup=kb([[("▶️ 开始 2 分钟", "timer_micro")]]),
-    )
+        f"🔒 <b>已锁定</b>：{text}\n\n🔹 <b>2 分钟起步</b>\n\n{ms['instruction']}\n\n✅ {ms['acceptance_criteria']}",
+        parse_mode="HTML", reply_markup=bkb([[("▶️ 开始 2 分钟", "timer_micro")]]))
 
 
-# ═══════════════════════════════════════════
-# COMMANDS: /evidence /status
-# ═══════════════════════════════════════════
+# ── Extra commands ──
 
 async def cmd_evidence(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    evs = db.list_evidence(user_id, limit=10)
+    uid = update.effective_user.id
+    evs = list_evidence(uid, 10)
     if not evs:
-        await update.message.reply_text("📋 证据库还是空的。发 /today 完成第一步。")
+        await update.message.reply_text("📋 证据库空的。发 /today 完成第一步。")
         return
-    user = db.get_user(user_id)
-    lines = [f"📋 <b>证据库</b>（共 {len(evs)} 条）\n"]
-    for ev in evs:
-        lines.append(f"  · {ev['counter_evidence'][:60]}")
-    lines.append(f"\n🔥 连续推进 <b>{user['streak_days']}</b> 天")
+    u = get_user(uid)
+    lines = [f"📋 <b>证据库</b>（{len(evs)}）\n"]
+    for e in evs: lines.append(f"  · {e['counter_evidence'][:60]}")
+    lines.append(f"\n🔥 连续 <b>{u['streak_days']}</b> 天")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
-    goal = db.get_active_goal(user_id)
+    uid = update.effective_user.id
+    u = get_user(uid)
+    goal = get_active_goal(uid)
     lines = ["📊 <b>状态</b>\n"]
     if goal:
-        lines.append(f"🧭 目标：{goal['title']}")
-        phase = db.get_active_phase(goal["goal_id"])
+        lines.append(f"🧭 {goal['title']}")
+        phase = get_active_phase(goal["goal_id"])
         if phase:
-            lines.append(f"📂 阶段：{phase['title']}")
-            tasks = db.list_tasks(phase["phase_id"])
+            tasks = list_tasks(phase["phase_id"])
             c = sum(1 for t in tasks if t["status"] == "completed")
-            lines.append(f"📋 任务：{c}/{len(tasks)}")
-    lines.append(f"🔥 连续：{user['streak_days']} 天")
-    deferred = db.get_deferred(user_id)
-    if deferred:
-        lines.append(f"⏸ 有未完成步骤待继续")
+            lines.append(f"📂 {phase['title']}  📋 {c}/{len(tasks)}")
+    lines.append(f"🔥 连续：{u['streak_days']} 天")
+    df = get_deferred(uid)
+    if df: lines.append("⏸ 有未完成步骤")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-# ═══════════════════════════════════════════
-# HELPER
-# ═══════════════════════════════════════════
-
-async def _send(msg, text, markup):
-    """Send or edit message."""
-    try:
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except:
-        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
-
-
-# ═══════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════
+###############################################################################
+# ██████  MAIN
+###############################################################################
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        print("=" * 50)
-        print("ERROR: 请设置环境变量 TELEGRAM_BOT_TOKEN")
-        print("=" * 50)
+        print("ERROR: 设置 TELEGRAM_BOT_TOKEN 环境变量")
         return
 
-    # Init database
-    db.init_db()
-    logger.info("Database initialized")
+    init_db()
+    logger.info("DB initialized")
 
-    # Check OpenAI key
-    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if openai_key:
-        logger.info("OpenAI API key found, LLM features enabled")
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        logger.info("OpenAI enabled")
     else:
-        logger.warning("OPENAI_API_KEY not set, using fallback responses")
+        logger.warning("OPENAI_API_KEY not set → fallback mode")
 
     app = Application.builder().token(token).build()
-
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("manage", cmd_manage))
     app.add_handler(CommandHandler("evidence", cmd_evidence))
     app.add_handler(CommandHandler("status", cmd_status))
-
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(callback_router))
-
-    # Text
+    app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🚀 Execution Companion Bot v2 is running...")
